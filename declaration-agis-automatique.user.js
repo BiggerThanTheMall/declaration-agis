@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         LTOA - Agent Déclaration AGIS (Lot visible)
 // @namespace    https://ltoa-assurances.fr/
-// @version      1.1.2
+// @version      1.1.3
 // @description  Traite les contrats AGIS, contrôle chaque preuve de paiement dans toute la GED, puis génère une déclaration Excel financièrement sécurisée et un JSON auditable.
 // @author       LTOA Assurances
 // @match        https://courtage.modulr.fr/*
@@ -11,6 +11,8 @@
 // @grant        GM_xmlhttpRequest
 // @connect      courtage.modulr.fr
 // @run-at       document-idle
+// @updateURL    https://raw.githubusercontent.com/BiggerThanTheMall/declaration-agis/main/declaration-agis-automatique.user.js
+// @downloadURL  https://raw.githubusercontent.com/BiggerThanTheMall/declaration-agis/main/declaration-agis-automatique.user.js
 // ==/UserScript==
 
 (function () {
