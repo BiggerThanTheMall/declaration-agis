@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         LTOA - Déclaration AGIS Automatique
 // @namespace    https://github.com/BiggerThanTheMall
-// @version      1.0.0
+// @version      1.1.0
 // @description  Traite les contrats AGIS visibles, lit les pièces contractuelles et règlements, puis génère la déclaration Excel AGIS et un JSON auditable.
 // @author       BiggerThanTheMall i mean of course who else
 // @match        https://courtage.modulr.fr/*
@@ -20,7 +20,7 @@
     'use strict';
 
     const APP_ID = 'ltoa-agent-declaration-agis';
-    const CURRENT_VERSION = '1.0.0';
+    const CURRENT_VERSION = '1.1.0';
     const STORAGE_KEY = 'ltoa.agentDeclarationAgis.v0.1';
     const ACTIVE_MONTH_KEY = 'ltoa.agentDeclarationAgis.activeMonth.v1';
     const MONTH_STATE_PREFIX = 'ltoa.agentDeclarationAgis.month.v1.';
@@ -31,7 +31,14 @@
     const AGIS_COMPANY_ID = '50';
     const AGIS_COMPANY_URL = `${location.origin}${AGIS_COMPANY_PATH}?company_id=${AGIS_COMPANY_ID}#entity_menu_company=0`;
     const GED_PREFIX = '/fr/intranet/edm/display/Client/';
-    const PAYMENT_WORDS = /\b(justif(?:icatif)?|paiement|r[eè]glement|ch[eè]que|virement|stripe|paypal|re[cç]u|facture|acquitt[eé]e?)\b/i;
+    const PAYMENT_WORDS = Object.freeze([
+        'justificatif', 'justif', 'paiement', 'reglement', 'cheque', 'virement',
+        'stripe', 'paypal', 'ppal', 'recu', 'facture', 'acquittee', 'encaissement',
+        'encaisse', 'especes', 'carte', 'cb',
+    ]);
+    const PAYMENT_TITLE_NEGATIVE = /\b(perdu(?:e)?|perte|refus[eé]?|rejet[eé]?|annul[eé]?|rembours[eé]?|impay[eé]?|opposition|fraude|erreur|sans\s+suite|non[\s-]+encaiss[eé]?|non[\s-]+re[cç]u|en\s+attente|[àa]\s+encaisser)\b/i;
+    const PAYMENT_CONTENT_NEGATIVE = /\b(?:(?:[ée]tat|statut|status)(?:\s+de\s+la\s+transaction)?\s*:?\s*(?:en\s+attente|pending|processing|programm[eé]?|planifi[eé]?|brouillon|draft|initiated|refus[eé]?|failed|declined|rejet[eé]?|annul[eé]?|cancelled|canceled|rembours[eé]?|refunded|impay[eé]?|chargeback)|(?:paiement|transaction|virement|ch[eè]que)\s+(?:est\s+)?(?:en\s+attente|refus[eé]?|rejet[eé]?|annul[eé]?|rembours[eé]?|impay[eé]?|non[\s-]+ex[eé]cut[eé]?|non[\s-]+encaiss[eé]?))\b/i;
+    const PAYMENT_FINAL_POSITIVE = /\b(termin[eé]e?|completed|r[eé]ussi(?:e)?|succeeded|pay[eé]e?|paid|re[cç]u|received|effectu[eé]e?|ex[eé]cut[eé]e?|cr[eé]dit[eé]e?|encaiss[eé]e?|valid[eé]e?|confirm[eé]e?|settled|captur[eé]e?)\b/i;
     const QUOTE_WORDS = /\b(devis|proposition|adh[eé]sion)\b/i;
     const COVERAGE_WORDS = /\b(devis|proposition|adh[eé]sion|contrat|conditions? particuli[eè]res?|bulletin|attestation|renouvellement|sign[eé])\b/i;
     const AGIS_CP_TEMPLATE = Object.freeze({
@@ -56,6 +63,37 @@
             .replace(/[^a-z0-9]+/g, ' ')
             .replace(/\s+/g, ' ')
             .trim();
+    }
+
+    function editDistance(left, right) {
+        const a = String(left || '');
+        const b = String(right || '');
+        const row = Array.from({ length: b.length + 1 }, (_, index) => index);
+        for (let i = 1; i <= a.length; i += 1) {
+            let previous = row[0];
+            row[0] = i;
+            for (let j = 1; j <= b.length; j += 1) {
+                const saved = row[j];
+                row[j] = Math.min(
+                    row[j] + 1,
+                    row[j - 1] + 1,
+                    previous + (a[i - 1] === b[j - 1] ? 0 : 1)
+                );
+                previous = saved;
+            }
+        }
+        return row[b.length];
+    }
+
+    function titleHasPaymentSignal(value) {
+        const normalized = normalize(value);
+        const tokens = normalized.split(' ').filter(Boolean);
+        if (/\b(facture\s+acquittee|preuve\s+de\s+paiement|recu\s+de\s+paiement)\b/.test(normalized)) return true;
+        return tokens.some(token => PAYMENT_WORDS.some(keyword => {
+            if (token === keyword) return true;
+            if (token.length < 5 || keyword.length < 5) return false;
+            return Math.abs(token.length - keyword.length) <= 2 && editDistance(token, keyword) <= 2;
+        }));
     }
 
     function normalizePersonName(value) {
@@ -675,8 +713,8 @@
         await captureGedAndContinue();
     }
 
-    function parseGedDocuments() {
-        const rows = Array.from(document.querySelectorAll('table.table_ged tbody tr.no_hover_background'));
+    function parseGedDocuments(scope = document, pageNumber = 1) {
+        const rows = Array.from(scope.querySelectorAll('table.table_ged tbody tr.no_hover_background'));
         const documents = rows.map(row => {
             const link = row.querySelector('a[id*="_ged_link_"][href*="/edm/download/"]');
             if (!link) return null;
@@ -684,7 +722,7 @@
             const dateMatch = text.match(/Date d'ajout\s*:\s*(\d{2}\/\d{2}\/\d{4})\s+(\d{2}:\d{2})/i);
             const idMatch = link.href.match(/\/download\/(\d+)/);
             const name = clean(link.textContent);
-            const isPaymentCandidate = PAYMENT_WORDS.test(name);
+            const isPaymentCandidate = titleHasPaymentSignal(name);
             const isQuoteCandidate = QUOTE_WORDS.test(name);
             const isCoverageCandidate = COVERAGE_WORDS.test(name)
                 || (!isPaymentCandidate && /\b(adobe scan|scan|document)\b/i.test(name));
@@ -694,6 +732,7 @@
                 name,
                 uploadDate: dateMatch ? `${dateMatch[1]} ${dateMatch[2]}` : '',
                 downloadUrl: link.href,
+                gedPage: pageNumber,
                 isPaymentCandidate,
                 isQuoteCandidate,
                 isCoverageCandidate,
@@ -707,6 +746,88 @@
         return documents.filter((documentInfo, index, all) =>
             all.findIndex(candidate => candidate.documentId === documentInfo.documentId) === index
         );
+    }
+
+    function findGedNextPageLink() {
+        const table = document.querySelector('table.table_ged');
+        const scope = table?.closest('.ged_container') || table?.parentElement || document;
+        return Array.from(scope.querySelectorAll('a, button')).find(element => {
+            const label = normalize(`${element.textContent || ''} ${element.title || ''} ${element.getAttribute('aria-label') || ''}`);
+            const disabled = element.disabled
+                || element.getAttribute('aria-disabled') === 'true'
+                || element.classList.contains('disabled');
+            return !disabled && (label === 'page suivante' || label === 'suivant' || label.includes('page suivante'));
+        }) || null;
+    }
+
+    function waitForGedPageChange(previousSignature, timeout = 12000) {
+        return new Promise((resolve, reject) => {
+            const startedAt = Date.now();
+            const check = () => {
+                const signature = parseGedDocuments().map(item => item.documentId).join('|');
+                if (signature && signature !== previousSignature) {
+                    resolve();
+                    return true;
+                }
+                if (Date.now() - startedAt >= timeout) {
+                    reject(new Error('La page suivante de la GED ne s’est pas chargée.'));
+                    return true;
+                }
+                return false;
+            };
+            if (check()) return;
+            const observer = new MutationObserver(() => {
+                if (check()) observer.disconnect();
+            });
+            observer.observe(document.body, { childList: true, subtree: true });
+            const timer = setInterval(() => {
+                if (check()) {
+                    clearInterval(timer);
+                    observer.disconnect();
+                }
+            }, 350);
+        });
+    }
+
+    async function collectAllGedDocuments(state) {
+        const collected = [];
+        const seenIds = new Set();
+        const seenPages = new Set();
+        let pageNumber = 1;
+        let complete = true;
+
+        while (pageNumber <= 50) {
+            const pageDocuments = parseGedDocuments(document, pageNumber);
+            const signature = pageDocuments.map(item => item.documentId).join('|');
+            if (!signature || seenPages.has(signature)) break;
+            seenPages.add(signature);
+            pageDocuments.forEach(item => {
+                if (seenIds.has(item.documentId)) return;
+                seenIds.add(item.documentId);
+                collected.push(item);
+            });
+            const nextLink = findGedNextPageLink();
+            if (!nextLink) break;
+            setMessage(`GED : ${collected.length} pièce(s) trouvée(s), ouverture de la page ${pageNumber + 1}…`);
+            nextLink.click();
+            try {
+                await waitForGedPageChange(signature);
+            } catch (error) {
+                complete = false;
+                state.warnings.push(`Pagination GED interrompue après ${collected.length} pièce(s) : ${error.message}`);
+                break;
+            }
+            pageNumber += 1;
+        }
+        if (pageNumber > 50 && findGedNextPageLink()) {
+            complete = false;
+            state.warnings.push('Plus de 50 pages GED détectées : arrêt de sécurité et contrôle humain requis.');
+        }
+        state.gedDocumentsScope = complete ? 'all-client-documents-all-pages' : 'all-client-documents-partial-pages';
+        state.gedPagesScanned = pageNumber;
+        state.gedDocumentsScanned = collected.length;
+        saveState(state);
+        return collected;
     }
 
     function extractCoveredPersons(text) {
@@ -905,7 +1026,7 @@
             setMessage(`Initialisation OCR pour « ${documentName} »…`);
             worker = await tesseract.createWorker('fra');
             const pageTexts = [];
-            const pageLimit = Math.min(pdf.numPages, 2);
+            const pageLimit = Math.min(pdf.numPages, 30);
             for (let pageNumber = 1; pageNumber <= pageLimit; pageNumber += 1) {
                 setMessage(`OCR « ${documentName} » — page ${pageNumber}/${pageLimit}…`);
                 const page = await pdf.getPage(pageNumber);
@@ -922,8 +1043,11 @@
             }
             const ocrText = pageTexts.join('\n').slice(0, 30000);
             return {
-                status: ocrText.trim() ? 'ocr-read' : 'ocr-empty',
+                status: ocrText.trim()
+                    ? (pageLimit < pdf.numPages ? 'ocr-partial' : 'ocr-read')
+                    : 'ocr-empty',
                 ocrPageCount: pageLimit,
+                ocrTotalPages: pdf.numPages,
                 ocrText,
                 coveredPersons: extractAllCoveredPersons(ocrText),
             };
@@ -1033,12 +1157,13 @@
             let coveredPersons = extractAllCoveredPersons(extractedText);
             if (!coveredPersons.length) {
                 const ocrResult = await ocrPdfPages(pdf, documentInfo.name);
-                if (ocrResult.status === 'ocr-read') coveredPersons = ocrResult.coveredPersons;
+                if (['ocr-read', 'ocr-partial'].includes(ocrResult.status)) coveredPersons = ocrResult.coveredPersons;
                 return {
                     status: ocrResult.status,
                     pageCount: pdf.numPages,
                     extractedText,
                     ocrPageCount: ocrResult.ocrPageCount,
+                    ocrTotalPages: ocrResult.ocrTotalPages,
                     ocrText: ocrResult.ocrText,
                     coveredPersons,
                     error: ocrResult.error,
@@ -1059,10 +1184,13 @@
         const fileContent = `${documentInfo.contentRead?.extractedText || ''}\n${documentInfo.contentRead?.ocrText || ''}`;
         const content = `${documentInfo.name || ''}\n${fileContent}`;
         const methods = [];
-        if (/\bch[eè]que\b/i.test(content)) methods.push('cheque');
-        if (/\bvirement\b|ordre de virement/i.test(content)) methods.push('virement');
+        const normalizedContent = normalize(content);
+        if (/\b(ch[eè]que|cheque)\b/i.test(content) || titleHasPaymentSignal(documentInfo.name) && /\bcheq\w*\b/.test(normalizedContent)) methods.push('cheque');
+        if (/\bvirement\b|ordre de virement/i.test(content) || /\bvire?ment\b/.test(normalizedContent)) methods.push('virement');
         if (/\bstripe\b/i.test(content)) methods.push('stripe');
-        if (/\bpaypal\b/i.test(content)) methods.push('paypal');
+        if (/\bpaypal\b/i.test(content) || /\bppal\b/.test(normalizedContent)) methods.push('paypal');
+        if (/\b(?:carte bancaire|paiement par carte|cb)\b/i.test(content)) methods.push('carte-bancaire');
+        if (/\b(?:esp[eè]ces?|liquide|billet)\b/i.test(content)) methods.push('especes');
         if (/\bpr[eé]l[eè]vement\b/i.test(content)) methods.push('prelevement');
         if (/\bfacture\b.*\bacquitt[eé]e?\b|\bacquitt[eé]e?\b/i.test(content)) methods.push('facture-acquittee');
         const amounts = Array.from(content.matchAll(/\b(\d{1,5}(?:[ .]\d{3})*(?:[,.]\d{2})?)\s*(?:€|EUR)/gi))
@@ -1080,6 +1208,11 @@
             amounts,
             dates,
             hasReadableContent: Boolean(normalize(fileContent)),
+            titleNegative: PAYMENT_TITLE_NEGATIVE.test(documentInfo.name || ''),
+            contentNegative: PAYMENT_CONTENT_NEGATIVE.test(fileContent),
+            hasFinalStatus: PAYMENT_FINAL_POSITIVE.test(fileContent),
+            titlePaymentSignal: titleHasPaymentSignal(documentInfo.name),
+            isImage: Boolean(documentInfo.contentRead?.imageMimeType),
         };
     }
 
@@ -1217,18 +1350,109 @@
         return Array.from(group);
     }
 
+    function extractExpectedPaymentAmounts(result) {
+        const amounts = [];
+        const amountPattern = /(\d{1,5}(?:[ .]\d{3})*(?:[,.]\d{2})?)\s*(?:€|EUR)/gi;
+        const paymentLabel = /\b(cotisation|prime|tarif|total\s+[àa]\s+payer|montant\s+[àa]\s+payer|net\s+[àa]\s+payer|annuel(?:le)?)\b/i;
+        for (const documentInfo of contractDocumentsForResult(result)) {
+            const content = documentContent(documentInfo);
+            for (const match of content.matchAll(amountPattern)) {
+                const context = content.slice(Math.max(0, match.index - 90), match.index + match[0].length + 90);
+                if (!paymentLabel.test(context)) continue;
+                const value = Number(match[1].replace(/\s/g, '').replace(',', '.'));
+                if (Number.isFinite(value) && value > 0) amounts.push(value);
+            }
+        }
+        return amounts.filter((value, index, all) =>
+            all.findIndex(candidate => Math.abs(candidate - value) < 0.01) === index
+        );
+    }
+
+    function paymentAmountMatches(paymentAmounts, expectedAmounts) {
+        if (!paymentAmounts.length || !expectedAmounts.length) return false;
+        return paymentAmounts.some(paid => expectedAmounts.some(expected => Math.abs(paid - expected) < 0.02));
+    }
+
+    function assessPaymentDocument(documentInfo, result) {
+        const facts = documentInfo.paymentFacts || extractPaymentFacts(documentInfo);
+        const expectedAmounts = extractExpectedPaymentAmounts(result);
+        const amountMatches = paymentAmountMatches(facts.amounts || [], expectedAmounts);
+        const methods = facts.methods || [];
+        const isPhysical = methods.some(method => ['cheque', 'especes'].includes(method));
+        const isElectronic = methods.some(method =>
+            ['paypal', 'stripe', 'virement', 'carte-bancaire', 'prelevement'].includes(method)
+        );
+        const isScannedEvidence = facts.isImage || facts.readStatus === 'ocr-read';
+        const reasons = [];
+
+        if (facts.titleNegative || facts.contentNegative) {
+            reasons.push(facts.titleNegative
+                ? 'Le titre de la pièce indique un paiement problématique.'
+                : 'Le document contient une mention d’attente, de rejet, d’annulation ou de remboursement.');
+            return { status: 'non-justified', reasons, expectedAmounts, amountMatches };
+        }
+        if (!facts.hasReadableContent && !facts.isImage) {
+            reasons.push('La pièce n’a pas pu être lue.');
+            return { status: 'needs-review', reasons, expectedAmounts, amountMatches };
+        }
+        if (facts.readStatus === 'ocr-partial') {
+            reasons.push('Le PDF scanné dépasse 30 pages : la lecture OCR est partielle.');
+            return { status: 'needs-review', reasons, expectedAmounts, amountMatches };
+        }
+        if (!expectedAmounts.length) reasons.push('Montant contractuel attendu non extrait automatiquement.');
+        else if (!facts.amounts?.length) reasons.push('Aucun montant lisible dans le justificatif.');
+        else if (!amountMatches) {
+            reasons.push(`Montant du justificatif (${facts.amounts.join(' / ')} €) différent du montant attendu (${expectedAmounts.join(' / ')} €).`);
+        }
+        if (isElectronic && !facts.hasFinalStatus) {
+            reasons.push('Aucun statut définitif de paiement n’est lisible dans la pièce électronique.');
+        }
+        if (!methods.length) reasons.push('Moyen de paiement non reconnu dans le titre ou le contenu.');
+
+        const physicalConfirmed = (isPhysical || (isScannedEvidence && facts.titlePaymentSignal && !isElectronic))
+            && facts.titlePaymentSignal
+            && amountMatches
+            && !facts.titleNegative
+            && !facts.contentNegative;
+        const electronicConfirmed = isElectronic
+            && facts.hasFinalStatus
+            && amountMatches
+            && !facts.titleNegative
+            && !facts.contentNegative;
+        const acquittedConfirmed = methods.includes('facture-acquittee')
+            && facts.hasFinalStatus
+            && amountMatches;
+
+        return {
+            status: physicalConfirmed || electronicConfirmed || acquittedConfirmed ? 'confirmed' : 'needs-review',
+            reasons,
+            expectedAmounts,
+            amountMatches,
+            method: methods.join(', '),
+        };
+    }
+
     function assessBatchPayments(results) {
         return results.map(result => {
             const directDocuments = result.ged?.paymentCandidates || [];
             if (directDocuments.length) {
+                const documentAssessments = directDocuments.map(documentInfo => ({
+                    documentId: documentInfo.documentId,
+                    name: documentInfo.name,
+                    uploadDate: documentInfo.uploadDate,
+                    paymentFacts: documentInfo.paymentFacts || null,
+                    decision: assessPaymentDocument(documentInfo, result),
+                }));
+                const confirmed = documentAssessments.find(item => item.decision.status === 'confirmed');
+                const uncertain = documentAssessments.find(item => item.decision.status === 'needs-review');
+                const rejected = documentAssessments.every(item => item.decision.status === 'non-justified');
                 result.paymentAssessment = {
-                    status: 'document-detected',
-                    directDocuments: directDocuments.map(documentInfo => ({
-                        documentId: documentInfo.documentId,
-                        name: documentInfo.name,
-                        uploadDate: documentInfo.uploadDate,
-                        paymentFacts: documentInfo.paymentFacts || null,
-                    })),
+                    status: confirmed ? 'confirmed' : (uncertain ? 'needs-review' : (rejected ? 'non-justified' : 'needs-review')),
+                    directDocuments: documentAssessments,
+                    selectedDocumentId: confirmed?.documentId || uncertain?.documentId || documentAssessments[0]?.documentId || '',
+                    note: confirmed
+                        ? 'Paiement confirmé automatiquement par le contenu de la pièce.'
+                        : documentAssessments.flatMap(item => item.decision.reasons || []).filter(Boolean).join(' '),
                 };
                 return result;
             }
@@ -1244,7 +1468,7 @@
                 })));
             if (relatedEvidence.length) {
                 result.paymentAssessment = {
-                    status: 'possible-shared-document',
+                    status: 'needs-review',
                     relatedPolicyIds: paymentGroup.map(item => item.policy?.policyId).filter(Boolean),
                     relatedEvidence,
                     note: 'Paiement familial potentiel : le contenu et le montant doivent couvrir les contrats regroupés.',
@@ -1252,10 +1476,11 @@
                 return result;
             }
             result.paymentAssessment = {
-                status: normalize(result.policy?.state).includes('en cours')
-                    ? 'active-contract-no-payment-document'
-                    : 'payment-not-confirmed',
+                status: 'non-justified',
                 relatedEvidence: [],
+                note: normalize(result.policy?.state).includes('en cours')
+                    ? 'Contrat en cours, mais aucun justificatif de paiement n’a été retrouvé dans la GED.'
+                    : 'Aucun justificatif de paiement confirmé.',
             };
             return result;
         });
@@ -1264,7 +1489,7 @@
     async function captureGedAndContinue() {
         const state = loadState();
         if (!state || state.status !== 'opening-ged') return;
-        const documents = parseGedDocuments();
+        const documents = await collectAllGedDocuments(state);
         documents.forEach(documentInfo => annotateDocumentRelevance(documentInfo, state));
         await readRelevantDocuments(documents.filter(documentInfo => documentInfo.declarationRelevance?.level !== 'unlikely'));
         documents.forEach(documentInfo => annotateDocumentRelevance(documentInfo, state));
@@ -1307,6 +1532,8 @@
                 reason: documentInfo.contractAttribution?.reason || '',
             })),
             documentsScope: state.gedDocumentsScope || 'unknown',
+            pagesScanned: state.gedPagesScanned || 1,
+            documentsScanned: state.gedDocumentsScanned || documents.length,
             paymentCandidates,
             quoteCandidates: contractDocuments.filter(document => document.isQuoteCandidate),
             coveredPersons,
@@ -1325,6 +1552,9 @@
         }
         for (const documentInfo of relevantDocuments.filter(item => ['ocr-empty', 'ocr-unavailable', 'unsupported-format'].includes(item.contentRead?.status))) {
             state.warnings.push(`OCR sans résultat pour « ${documentInfo.name} » (contrat ${state.selectedPolicy?.policyId || ''}).`);
+        }
+        for (const documentInfo of relevantDocuments.filter(item => item.contentRead?.status === 'ocr-partial')) {
+            state.warnings.push(`OCR partiel pour « ${documentInfo.name} » : ${documentInfo.contentRead?.ocrPageCount || 30} page(s) lue(s) sur ${documentInfo.contentRead?.ocrTotalPages || 'davantage'}.`);
         }
         for (const documentInfo of relevantDocuments.filter(item => ['read-error', 'reader-unavailable', 'ocr-error'].includes(item.contentRead?.status))) {
             state.warnings.push(`Lecture impossible pour « ${documentInfo.name} » : ${documentInfo.contentRead.error || documentInfo.contentRead.status}.`);
@@ -1353,11 +1583,11 @@
         }
 
         state.results = assessBatchPayments(state.results);
-        for (const result of state.results.filter(item => item.paymentAssessment?.status === 'possible-shared-document')) {
-            state.warnings.push(`Justificatif familial possible à contrôler pour le contrat ${result.policy?.policyId || ''}.`);
+        for (const result of state.results.filter(item => item.paymentAssessment?.status === 'needs-review')) {
+            state.warnings.push(`Paiement à contrôler humainement pour le contrat ${result.policy?.policyId || ''} : ${result.paymentAssessment?.note || 'preuve incertaine'}`);
         }
-        for (const result of state.results.filter(item => item.paymentAssessment?.status === 'active-contract-no-payment-document')) {
-            state.warnings.push(`Contrat en cours sans justificatif de règlement GED détecté : ${result.policy?.policyId || ''}.`);
+        for (const result of state.results.filter(item => item.paymentAssessment?.status === 'non-justified')) {
+            state.warnings.push(`Contrat exclu par défaut faute de paiement justifié : ${result.policy?.policyId || ''}.`);
         }
         state.status = 'batch-completed';
         state.completedAt = new Date().toISOString();
@@ -1720,6 +1950,12 @@
             const derivedAdhesionType = /^famille$/i.test(facts.type) || beneficiaries.length ? 'Famille' : 'Individuel';
             const adhesionType = contractOverride.adhesionType || derivedAdhesionType;
             const country = contractOverride.country !== undefined ? contractOverride.country : (facts.country || '');
+            const detectedPaymentStatus = ['confirmed', 'needs-review', 'non-justified'].includes(result.paymentAssessment?.status)
+                ? result.paymentAssessment.status
+                : 'needs-review';
+            const paymentStatus = ['confirmed', 'needs-review', 'non-justified'].includes(contractOverride.paymentStatus)
+                ? contractOverride.paymentStatus
+                : detectedPaymentStatus;
             const excludedDocuments = (result.ged?.relevantDocuments || []).filter(documentInfo =>
                 documentInfo.isCoverageCandidate
                 && documentInfo.contractAttribution?.level === 'excluded'
@@ -1753,6 +1989,9 @@
                         : (override.role === 'Souscripteur' ? 'Souscripteur' : person.role),
                     adhesionType,
                     country,
+                    paymentStatus,
+                    detectedPaymentStatus,
+                    paymentNote: result.paymentAssessment?.note || '',
                     declaredPersonCount: facts.personCount,
                     effectDate: result.policy?.effectDate || '',
                     expiration: facts.expiration || '',
@@ -1771,6 +2010,9 @@
                     evidenceDocuments: [
                         ...(person.sourcePerson?.evidenceDocuments || []),
                         ...facts.sources.map(source => source.name),
+                        ...(person.role === 'Souscripteur'
+                            ? (result.paymentAssessment?.directDocuments || []).map(source => source.name)
+                            : []),
                     ].filter(Boolean).filter((value, index, all) => all.indexOf(value) === index),
                 };
                 if (model.role === 'Souscripteur' && !model.country) {
@@ -1781,6 +2023,15 @@
                 }
                 if (model.role === 'Souscripteur' && excludedDocuments.length) {
                     model.issues.push(`Pièce(s) d'un autre contrat écartée(s) : ${excludedDocuments.map(item => item.name).join(', ')}`);
+                }
+                if (model.role === 'Souscripteur' && result.ged?.documentsScope === 'all-client-documents-partial-pages') {
+                    model.issues.push(`Parcours GED incomplet : ${result.ged?.pagesScanned || 1} page(s) et ${result.ged?.documentsScanned || 0} pièce(s) lues avant interruption`);
+                }
+                if (model.role === 'Souscripteur' && model.paymentStatus === 'needs-review') {
+                    model.issues.push(`Paiement à vérifier : ${model.paymentNote || 'la preuve ne permet pas une confirmation automatique'}`);
+                }
+                if (model.role === 'Souscripteur' && model.paymentStatus === 'non-justified') {
+                    model.issues.push(`Paiement non justifié — contrat exclu de l’Excel : ${model.paymentNote || 'aucune preuve recevable'}`);
                 }
                 if (person.role === 'Souscripteur' && explicitSubscriber
                     && !namesMatch(`${subscriber.lastName} ${subscriber.firstName}`, explicitSubscriber.name)) {
@@ -1865,7 +2116,7 @@
     }
 
     function buildAgisRows(state) {
-        return buildAgisRowModels(state).map(model => [
+        return buildAgisRowModels(state).filter(model => model.paymentStatus === 'confirmed').map(model => [
             'Avenir',
             model.adhesionType,
             model.contractNumber,
@@ -1899,6 +2150,7 @@
             role: model.role,
             adhesionType: model.adhesionType,
             country: model.country,
+            paymentStatus: model.paymentStatus,
             civility: model.civility,
             lastName: model.lastName,
             firstName: model.firstName,
@@ -1914,6 +2166,12 @@
 
     function unresolvedReviewRows(state) {
         return buildAgisRowModels(state).filter(model => model.requiresReview && !model.validated);
+    }
+
+    function unresolvedPaymentContracts(state) {
+        return buildAgisRowModels(state).filter(model =>
+            model.role === 'Souscripteur' && model.paymentStatus === 'needs-review'
+        );
     }
 
     function escapeHtml(value) {
@@ -2059,6 +2317,11 @@
                     { value: 'Individuel', label: 'Individuel' },
                     { value: 'Famille', label: 'Famille' },
                 ], 'Adhésion', true)}
+                ${segmentedChoice('data-contract-field', 'paymentStatus', subscriberModel.paymentStatus, [
+                    { value: 'confirmed', label: 'Confirmé' },
+                    { value: 'needs-review', label: 'À vérifier' },
+                    { value: 'non-justified', label: 'Non justifié' },
+                ], 'Paiement')}
                 <label class="ltoa-field ltoa-field-country"><span>Pays de rapatriement</span><input data-contract-field="country" value="${escapeHtml(subscriberModel.country)}" placeholder="À renseigner" aria-label="Pays d'inhumation"></label>`;
             const people = group.map((model, personIndex) => {
                 const evidence = model.evidenceDocuments?.length
@@ -2146,6 +2409,11 @@
         review.fingerprint = null;
         saveState(state);
         const remaining = unresolvedReviewRows(state);
+        const undecidedPayments = unresolvedPaymentContracts(state);
+        if (confirmDeclaration && undecidedPayments.length) {
+            renderReviewPanel();
+            throw new Error(`${undecidedPayments.length} paiement(s) sont encore « À vérifier ». Passez-les en « Confirmé » ou « Non justifié » avant validation.`);
+        }
         if (confirmDeclaration && remaining.length) {
             renderReviewPanel();
             throw new Error(`${remaining.length} alerte(s) doivent encore être cochées comme vérifiées.`);
@@ -2172,9 +2440,12 @@
         const state = loadState();
         if (!state?.results?.length) throw new Error('Aucun contrat traité à exporter.');
         const unresolved = unresolvedReviewRows(state);
-        if (unresolved.length || !state.review?.completedAt) {
+        const undecidedPayments = unresolvedPaymentContracts(state);
+        if (unresolved.length || undecidedPayments.length || !state.review?.completedAt) {
             renderReviewPanel();
-            throw new Error(unresolved.length
+            throw new Error(undecidedPayments.length
+                ? `${undecidedPayments.length} paiement(s) restent à trancher avant l’export.`
+                : unresolved.length
                 ? `${unresolved.length} alerte(s) doivent être vérifiées avant l’export.`
                 : 'Validez la déclaration dans l’écran de vérification avant l’export.');
         }
@@ -2224,7 +2495,10 @@
         state.excelExportedAt = new Date().toISOString();
         saveState(state);
         setTimeout(() => URL.revokeObjectURL(url), 3000);
-        setMessage(`Déclaration Excel créée : ${rows.length} ligne(s), numéros de contrat de 1 à ${state.results.length}.`);
+        const excludedContracts = buildAgisRowModels(state).filter(model =>
+            model.role === 'Souscripteur' && model.paymentStatus === 'non-justified'
+        ).length;
+        setMessage(`Déclaration Excel créée : ${rows.length} ligne(s). ${excludedContracts} contrat(s) sans paiement justifié ont été exclus.`);
     }
 
     const root = document.createElement('div');
@@ -2404,7 +2678,7 @@
         #${APP_ID} .ltoa-source-link svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.8; }
         #${APP_ID} .ltoa-source-link b { font-size: 10px; }
         #${APP_ID} .ltoa-link-missing { padding: 7px 9px; color: #9b5c18; background: #fff5e8; border-radius: 9px; font-size: 11px; font-weight: 650; }
-        #${APP_ID} .ltoa-contract-meta { display: grid; grid-template-columns: 210px minmax(190px,1fr) auto; align-items: end; gap: 10px; padding: 11px 16px; background: #fbfcfd; border-bottom: 1px solid var(--line); }
+        #${APP_ID} .ltoa-contract-meta { display: grid; grid-template-columns: 210px minmax(250px,1.2fr) minmax(190px,1fr) auto; align-items: end; gap: 10px; padding: 11px 16px; background: #fbfcfd; border-bottom: 1px solid var(--line); }
         #${APP_ID} .ltoa-contract-dates { display: flex; align-items: center; gap: 14px; padding: 8px 0; color: var(--muted); font-size: 11px; }
         #${APP_ID} .ltoa-contract-dates span { white-space: nowrap; }
         #${APP_ID} .ltoa-contract-dates b { margin-left: 3px; color: #354052; }
