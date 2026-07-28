@@ -1,26 +1,28 @@
 // ==UserScript==
-// @name         LTOA - Déclaration AGIS Automatique
-// @namespace    https://github.com/BiggerThanTheMall
-// @version      1.1.0
-// @description  Traite les contrats AGIS visibles, lit les pièces contractuelles et règlements, puis génère la déclaration Excel AGIS et un JSON auditable.
-// @author       BiggerThanTheMall i mean of course who else
+// @name         LTOA - Agent Déclaration AGIS (Lot visible)
+// @namespace    https://ltoa-assurances.fr/
+// @version      1.1.2
+// @description  Traite les contrats AGIS, contrôle chaque preuve de paiement dans toute la GED, puis génère une déclaration Excel financièrement sécurisée et un JSON auditable.
+// @author       LTOA Assurances
 // @match        https://courtage.modulr.fr/*
 // @require      https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js
-// @require      https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js
 // @require      https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js
 // @require      https://cdn.jsdelivr.net/npm/exceljs@4.4.0/dist/exceljs.min.js
 // @grant        GM_xmlhttpRequest
-// @connect      *
+// @connect      courtage.modulr.fr
 // @run-at       document-idle
-// @updateURL    https://raw.githubusercontent.com/BiggerThanTheMall/declaration-agis/main/declaration-agis-automatique.user.js
-// @downloadURL  https://raw.githubusercontent.com/BiggerThanTheMall/declaration-agis/main/declaration-agis-automatique.user.js
 // ==/UserScript==
 
 (function () {
     'use strict';
 
     const APP_ID = 'ltoa-agent-declaration-agis';
-    const CURRENT_VERSION = '1.1.0';
+    const CURRENT_VERSION = '1.1.2';
+    const TESSERACT_OCR_OPTIONS = Object.freeze({
+        workerPath: 'https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/worker.min.js',
+        corePath: 'https://cdn.jsdelivr.net/npm/tesseract.js-core@5.1.1',
+        langPath: 'https://cdn.jsdelivr.net/npm/@tesseract.js-data/fra@1.0.0/4.0.0_best_int',
+    });
     const STORAGE_KEY = 'ltoa.agentDeclarationAgis.v0.1';
     const ACTIVE_MONTH_KEY = 'ltoa.agentDeclarationAgis.activeMonth.v1';
     const MONTH_STATE_PREFIX = 'ltoa.agentDeclarationAgis.month.v1.';
@@ -1024,7 +1026,11 @@
         let worker;
         try {
             setMessage(`Initialisation OCR pour « ${documentName} »…`);
-            worker = await tesseract.createWorker('fra');
+            worker = await tesseract.createWorker(
+                'fra',
+                tesseract.OEM?.LSTM_ONLY ?? 1,
+                TESSERACT_OCR_OPTIONS
+            );
             const pageTexts = [];
             const pageLimit = Math.min(pdf.numPages, 30);
             for (let pageNumber = 1; pageNumber <= pageLimit; pageNumber += 1) {
@@ -1077,7 +1083,11 @@
         let worker;
         try {
             setMessage(`OCR de l’image « ${documentName} »…`);
-            worker = await tesseract.createWorker('fra');
+            worker = await tesseract.createWorker(
+                'fra',
+                tesseract.OEM?.LSTM_ONLY ?? 1,
+                TESSERACT_OCR_OPTIONS
+            );
             const recognition = await worker.recognize(new Blob([bytes], { type: mimeType }));
             const ocrText = String(recognition?.data?.text || '').slice(0, 30000);
             return {
