@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         LTOA - Agent Déclaration AGIS (Lot visible)
 // @namespace    https://ltoa-assurances.fr/
-// @version      1.1.3
+// @version      1.1.4
 // @description  Traite les contrats AGIS, contrôle chaque preuve de paiement dans toute la GED, puis génère une déclaration Excel financièrement sécurisée et un JSON auditable.
 // @author       LTOA Assurances
 // @match        https://courtage.modulr.fr/*
@@ -19,7 +19,7 @@
     'use strict';
 
     const APP_ID = 'ltoa-agent-declaration-agis';
-    const CURRENT_VERSION = '1.1.2';
+    const CURRENT_VERSION = '1.1.4';
     const TESSERACT_OCR_OPTIONS = Object.freeze({
         workerPath: 'https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/worker.min.js',
         corePath: 'https://cdn.jsdelivr.net/npm/tesseract.js-core@5.1.1',
@@ -67,6 +67,26 @@
             .replace(/[^a-z0-9]+/g, ' ')
             .replace(/\s+/g, ' ')
             .trim();
+    }
+
+    // Ne jamais tronquer un PDF à 1 000 caractères : clean() est volontairement
+    // conservé pour les libellés/UI, tandis que les contenus documentaires utilisent
+    // cette normalisation complète.
+    function normalizeDocumentText(value) {
+        return String(value || '')
+            .normalize('NFD')
+            .replace(/[\u0300-\u036f]/g, '')
+            .toLowerCase()
+            .replace(/[^a-z0-9]+/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim();
+    }
+
+    function normalizePersonNameLong(value) {
+        const latinized = String(value || '').replace(/[аеорсхуікмтвн]/gi, character => ({
+            а: 'a', е: 'e', о: 'o', р: 'p', с: 'c', х: 'x', у: 'y', і: 'i', к: 'k', м: 'm', т: 't', в: 'b', н: 'h',
+        })[character.toLowerCase()] || character);
+        return normalizeDocumentText(latinized);
     }
 
     function editDistance(left, right) {
@@ -1005,7 +1025,7 @@
 
         const source = documents.find(documentInfo => {
             const content = `${documentInfo.contentRead?.extractedText || ''}\n${documentInfo.contentRead?.ocrText || ''}`;
-            const normalizedContent = normalize(content);
+            const normalizedContent = normalizeDocumentText(content);
             return content.includes(birthDate) && identityTokens.every(token => normalizedContent.includes(token));
         });
         if (!source) return persons;
@@ -1129,14 +1149,41 @@
         });
     }
 
+    async function downloadBinaryWithSession(url) {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 45000);
+        try {
+            const response = await fetch(url, {
+                method: 'GET',
+                credentials: 'include',
+                redirect: 'follow',
+                cache: 'no-store',
+                signal: controller.signal,
+                headers: { Accept: 'application/pdf,image/*,*/*;q=0.8' },
+            });
+            if (!response.ok) throw new Error(`Téléchargement HTTP ${response.status || 'inconnu'}`);
+            const buffer = await response.arrayBuffer();
+            if (!buffer?.byteLength) throw new Error('Document Modulr vide');
+            return new Uint8Array(buffer);
+        } finally {
+            clearTimeout(timeout);
+        }
+    }
+
     async function downloadBinary(url) {
         let lastError;
-        for (let attempt = 1; attempt <= 2; attempt += 1) {
-            try {
-                return await downloadBinaryOnce(url);
-            } catch (error) {
-                lastError = error;
-                if (attempt < 2) await new Promise(resolve => setTimeout(resolve, 700));
+        const readers = [
+            () => downloadBinaryWithSession(url),
+            () => downloadBinaryOnce(url),
+        ];
+        for (const reader of readers) {
+            for (let attempt = 1; attempt <= 2; attempt += 1) {
+                try {
+                    return await reader();
+                } catch (error) {
+                    lastError = error;
+                    if (attempt < 2) await new Promise(resolve => setTimeout(resolve, 650));
+                }
             }
         }
         throw lastError || new Error('Téléchargement Modulr impossible');
@@ -1196,7 +1243,7 @@
         const fileContent = `${documentInfo.contentRead?.extractedText || ''}\n${documentInfo.contentRead?.ocrText || ''}`;
         const content = `${documentInfo.name || ''}\n${fileContent}`;
         const methods = [];
-        const normalizedContent = normalize(content);
+        const normalizedContent = normalizeDocumentText(content);
         if (/\b(ch[eè]que|cheque)\b/i.test(content) || titleHasPaymentSignal(documentInfo.name) && /\bcheq\w*\b/.test(normalizedContent)) methods.push('cheque');
         if (/\bvirement\b|ordre de virement/i.test(content) || /\bvire?ment\b/.test(normalizedContent)) methods.push('virement');
         if (/\bstripe\b/i.test(content)) methods.push('stripe');
@@ -1219,7 +1266,7 @@
             methods: methods.filter((value, index, all) => all.indexOf(value) === index),
             amounts,
             dates,
-            hasReadableContent: Boolean(normalize(fileContent)),
+            hasReadableContent: Boolean(normalizeDocumentText(fileContent)),
             titleNegative: PAYMENT_TITLE_NEGATIVE.test(documentInfo.name || ''),
             contentNegative: PAYMENT_CONTENT_NEGATIVE.test(fileContent),
             hasFinalStatus: PAYMENT_FINAL_POSITIVE.test(fileContent),
@@ -1244,14 +1291,14 @@
         const title = documentInfo.name || '';
         const fileContent = `${documentInfo.contentRead?.extractedText || ''}\n${documentInfo.contentRead?.ocrText || ''}`;
         const content = `${title}\n${fileContent}`;
-        const normalizedContent = normalize(content);
+        const normalizedContent = normalizeDocumentText(content);
         const extractYears = value => Array.from(String(value || '').matchAll(/(20\d{2})/g)).map(match => Number(match[1]))
             .filter((value, index, all) => all.indexOf(value) === index);
         const titleYears = extractYears(title);
         const contentYears = extractYears(fileContent);
         const years = [...titleYears, ...contentYears].filter((value, index, all) => all.indexOf(value) === index);
         const uploadYear = Number(documentInfo.uploadDate.match(/\d{2}\/\d{2}\/(20\d{2})/)?.[1] || 0);
-        const referenceMatch = Boolean(policyReference && normalize(content).includes(normalize(policyReference)));
+        const referenceMatch = Boolean(policyReference && normalizeDocumentText(content).includes(normalize(policyReference)));
         const effectDateMatch = Boolean(effectDate && content.includes(effectDate));
         const identityMatch = identityTokens.length >= 2 && identityTokens.every(token => normalizedContent.includes(token));
         const titleTargetYear = Boolean(targetYear && titleYears.includes(targetYear));
@@ -1306,7 +1353,7 @@
         const reasons = documentInfo.declarationRelevance?.reasons || [];
         if (reasons.includes('reference-contrat') || reasons.includes('identite')) return true;
         const identityTokens = normalizePersonName(state.selectedPolicy?.identity).split(' ').filter(token => token.length >= 2);
-        const content = normalizePersonName(`${documentInfo.name || ''}\n${documentContent(documentInfo)}`);
+        const content = normalizePersonNameLong(`${documentInfo.name || ''}\n${documentContent(documentInfo)}`);
         return identityTokens.length >= 2 && identityTokens.every(token => content.includes(token));
     }
 
@@ -1505,8 +1552,55 @@
         documents.forEach(documentInfo => annotateDocumentRelevance(documentInfo, state));
         await readRelevantDocuments(documents.filter(documentInfo => documentInfo.declarationRelevance?.level !== 'unlikely'));
         documents.forEach(documentInfo => annotateDocumentRelevance(documentInfo, state));
-        const relevantDocuments = documents.filter(documentInfo => documentInfo.declarationRelevance?.level !== 'unlikely');
-        const contractDocuments = selectContractCoverageDocuments(relevantDocuments, state);
+        let relevantDocuments = documents.filter(documentInfo => documentInfo.declarationRelevance?.level !== 'unlikely');
+        let contractDocuments = selectContractCoverageDocuments(relevantDocuments, state);
+
+        // Deuxième passe de rattrapage : si les pièces de premier rang ne suffisent pas,
+        // on élargit progressivement aux autres pièces contractuelles non lues.
+        // Le titre sert seulement à prioriser ; aucune donnée métier n'est validée par le titre.
+        let provisionalFacts = extractAgisContractFacts({
+            policy: state.selectedPolicy,
+            client: state.client,
+            ged: { contractDocuments },
+        });
+        let provisionalPersons = contractDocuments.flatMap(documentInfo => documentInfo.contentRead?.coveredPersons || []);
+        const needsMoreCoverageEvidence = () =>
+            !provisionalFacts.type
+            || !provisionalFacts.country
+            || !provisionalPersons.length;
+
+        if (needsMoreCoverageEvidence()) {
+            const unreadFallbacks = documents
+                .filter(documentInfo =>
+                    documentInfo.isCoverageCandidate
+                    && !documentInfo.contentRead
+                    && documentInfo.declarationRelevance?.level === 'unlikely'
+                )
+                .sort((left, right) => {
+                    const leftDistance = Math.abs(left.declarationRelevance?.uploadDistanceDays ?? 99999);
+                    const rightDistance = Math.abs(right.declarationRelevance?.uploadDistanceDays ?? 99999);
+                    return leftDistance - rightDistance;
+                });
+
+            for (const documentInfo of unreadFallbacks) {
+                setMessage(`Recherche complémentaire dans « ${documentInfo.name} »…`);
+                documentInfo.contentRead = await readPdfDocument(documentInfo);
+                if (documentInfo.isPaymentCandidate) documentInfo.paymentFacts = extractPaymentFacts(documentInfo);
+                annotateDocumentRelevance(documentInfo, state);
+
+                relevantDocuments = documents.filter(item => item.declarationRelevance?.level !== 'unlikely' || Boolean(item.contentRead));
+                contractDocuments = selectContractCoverageDocuments(relevantDocuments, state);
+                provisionalFacts = extractAgisContractFacts({
+                    policy: state.selectedPolicy,
+                    client: state.client,
+                    ged: { contractDocuments },
+                });
+                provisionalPersons = contractDocuments.flatMap(item => item.contentRead?.coveredPersons || []);
+
+                if (!needsMoreCoverageEvidence()) break;
+            }
+        }
+
         const excludedCoverageDocuments = relevantDocuments.filter(documentInfo =>
             documentInfo.isCoverageCandidate && documentInfo.contractAttribution?.level === 'excluded'
         );
@@ -1753,7 +1847,7 @@
     }
 
     function extractDestinationCountry(text) {
-        const normalized = normalize(text);
+        const normalized = normalizeDocumentText(text);
         const labels = [
             'pays designe en cas de rapatriement',
             'pays d inhumation',
@@ -1789,7 +1883,7 @@
 
         for (const documentInfo of documents) {
             const rawContent = documentContent(documentInfo);
-            const normalizedContent = normalize(rawContent);
+            const normalizedContent = normalizeDocumentText(rawContent);
             const lines = rawContent.split(/\r?\n/).map(line => clean(line, 160)).filter(Boolean);
             let documentUsed = false;
 
@@ -1855,6 +1949,12 @@
                 }
             }
             if (documentUsed) facts.sources.push({ documentId: documentInfo.documentId, name: documentInfo.name });
+        }
+
+        const coveredPersons = coveredPersonsForResult(result);
+        if (facts.personCount === null && coveredPersons.length) {
+            facts.personCount = coveredPersons.length;
+            facts.personCountScore = 1;
         }
 
         return {
