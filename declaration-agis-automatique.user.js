@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         LTOA - Agent Déclaration AGIS (Lot visible)
 // @namespace    https://ltoa-assurances.fr/
-// @version      1.1.4
+// @version      1.1.5
 // @description  Traite les contrats AGIS, contrôle chaque preuve de paiement dans toute la GED, puis génère une déclaration Excel financièrement sécurisée et un JSON auditable.
 // @author       LTOA Assurances
 // @match        https://courtage.modulr.fr/*
@@ -19,7 +19,7 @@
     'use strict';
 
     const APP_ID = 'ltoa-agent-declaration-agis';
-    const CURRENT_VERSION = '1.1.4';
+    const CURRENT_VERSION = '1.1.5';
     const TESSERACT_OCR_OPTIONS = Object.freeze({
         workerPath: 'https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/worker.min.js',
         corePath: 'https://cdn.jsdelivr.net/npm/tesseract.js-core@5.1.1',
@@ -1170,23 +1170,50 @@
         }
     }
 
+    function downloadBinaryWithXhr(url) {
+        return new Promise((resolve, reject) => {
+            const xhr = new XMLHttpRequest();
+            xhr.open('GET', url, true);
+            xhr.responseType = 'arraybuffer';
+            xhr.withCredentials = true;
+            xhr.timeout = 45000;
+            xhr.setRequestHeader('Accept', 'application/pdf,image/*,*/*;q=0.8');
+            xhr.onload = () => {
+                if (xhr.status < 200 || xhr.status >= 300 || !xhr.response) {
+                    reject(new Error(`XHR HTTP ${xhr.status || 'inconnu'}`));
+                    return;
+                }
+                const bytes = new Uint8Array(xhr.response);
+                if (!bytes.byteLength) {
+                    reject(new Error('XHR document vide'));
+                    return;
+                }
+                resolve(bytes);
+            };
+            xhr.onerror = () => reject(new Error('XHR Modulr impossible'));
+            xhr.ontimeout = () => reject(new Error('XHR Modulr expiré'));
+            xhr.send();
+        });
+    }
+
     async function downloadBinary(url) {
-        let lastError;
+        const errors = [];
         const readers = [
-            () => downloadBinaryWithSession(url),
-            () => downloadBinaryOnce(url),
+            ['fetch-session', () => downloadBinaryWithSession(url)],
+            ['xhr-session', () => downloadBinaryWithXhr(url)],
+            ['gm-xhr', () => downloadBinaryOnce(url)],
         ];
-        for (const reader of readers) {
+        for (const [readerName, reader] of readers) {
             for (let attempt = 1; attempt <= 2; attempt += 1) {
                 try {
                     return await reader();
                 } catch (error) {
-                    lastError = error;
+                    errors.push(`${readerName}#${attempt}: ${clean(error?.message || error, 140)}`);
                     if (attempt < 2) await new Promise(resolve => setTimeout(resolve, 650));
                 }
             }
         }
-        throw lastError || new Error('Téléchargement Modulr impossible');
+        throw new Error(`Téléchargement Modulr impossible — ${errors.join(' | ')}`);
     }
 
     async function readPdfDocument(documentInfo) {
@@ -1672,6 +1699,17 @@
             ged: state.ged,
         };
         currentResult.declarationFacts = extractAgisContractFacts(currentResult);
+        const unreadCurrentPriorityDocuments = (currentResult.ged?.documents || []).filter(documentInfo =>
+            ['confirmed', 'likely'].includes(documentInfo.declarationRelevance?.level)
+            && (documentInfo.isCoverageCandidate || documentInfo.isPaymentCandidate)
+            && ['read-error', 'reader-unavailable', 'ocr-error'].includes(documentInfo.contentRead?.status)
+        );
+        if (unreadCurrentPriorityDocuments.length) {
+            state.warnings.push(
+                `Pièces prioritaires de la campagne courante non lisibles pour le contrat ${state.selectedPolicy?.policyId || ''} : `
+                + unreadCurrentPriorityDocuments.map(item => item.name).join(' | ')
+            );
+        }
         if (!currentResult.declarationFacts.country) {
             state.warnings.push(`Pays d'inhumation introuvable dans les pièces rattachées au contrat ${state.selectedPolicy?.policyId || ''}.`);
         }
@@ -1869,6 +1907,25 @@
         return '';
     }
 
+    function documentMatchesCurrentGuaranteePeriod(documentInfo, result) {
+        const content = documentContent(documentInfo);
+        if (!content) return null;
+        const effectDate = result.policy?.effectDate || '';
+        const expiration = result.policy?.state?.match(/expire le\s+(\d{1,2}\/\d{1,2}\/\d{4})/i)?.[1] || '';
+        const datePairs = [];
+        const periodPatterns = [
+            /p[eé]riode\s+de\s+garantie[^\d]{0,40}(\d{1,2}\/\d{1,2}\/\d{4})[^\d]{0,50}(\d{1,2}\/\d{1,2}\/\d{4})/gi,
+            /du\s+(\d{1,2}\/\d{1,2}\/\d{4})\s+au\s+(\d{1,2}\/\d{1,2}\/\d{4})/gi,
+        ];
+        for (const pattern of periodPatterns) {
+            for (const match of content.matchAll(pattern)) datePairs.push([match[1], match[2]]);
+        }
+        if (!datePairs.length) return null;
+        return datePairs.some(([start, end]) =>
+            (!effectDate || start === effectDate) && (!expiration || end === expiration)
+        );
+    }
+
     function extractAgisContractFacts(result) {
         const effectDate = result.policy?.effectDate || '';
         const documents = contractDocumentsForResult(result);
@@ -1883,6 +1940,10 @@
 
         for (const documentInfo of documents) {
             const rawContent = documentContent(documentInfo);
+            const periodMatchState = documentMatchesCurrentGuaranteePeriod(documentInfo, result);
+            // Une pièce portant explicitement une autre période (ex. 2025-2026)
+            // ne peut jamais définir le type, le pays ou le nombre de personnes du contrat 2026-2027.
+            if (periodMatchState === false) continue;
             const normalizedContent = normalizeDocumentText(rawContent);
             const lines = rawContent.split(/\r?\n/).map(line => clean(line, 160)).filter(Boolean);
             let documentUsed = false;
@@ -1890,7 +1951,8 @@
             const explicitType = normalizedContent.match(/\btype de contrat\s+(individuel|famille)\b/)?.[1] || '';
             const profileType = normalizedContent.match(/\bprofile\s+(individuel|famille)\b/)?.[1] || '';
             const typeValue = explicitType || profileType;
-            const typeScore = explicitType ? 3 : (profileType ? 1 : 0);
+            const periodBonus = periodMatchState === true ? 10 : 0;
+            const typeScore = explicitType ? 3 + periodBonus : (profileType ? 1 + periodBonus : 0);
             if (typeScore > facts.typeScore) {
                 facts.type = typeValue.charAt(0).toUpperCase() + typeValue.slice(1);
                 facts.typeScore = typeScore;
@@ -1898,18 +1960,20 @@
             }
 
             const explicitCountry = extractDestinationCountry(rawContent);
-            if (explicitCountry && facts.countryScore < 3) {
+            const countryScore = explicitCountry ? 3 + (periodMatchState === true ? 10 : 0) : 0;
+            if (explicitCountry && countryScore > facts.countryScore) {
                 facts.country = explicitCountry;
-                facts.countryScore = 3;
+                facts.countryScore = countryScore;
                 documentUsed = true;
             }
 
             const personCountMatch = normalizedContent.match(
                 /\bnombre de personnes designees au contrat d assistance\s+(\d{1,2})\b/
             );
-            if (personCountMatch && facts.personCountScore < 3) {
+            const personCountScore = personCountMatch ? 3 + (periodMatchState === true ? 10 : 0) : 0;
+            if (personCountMatch && personCountScore > facts.personCountScore) {
                 facts.personCount = Number(personCountMatch[1]);
-                facts.personCountScore = 3;
+                facts.personCountScore = personCountScore;
                 documentUsed = true;
             }
 
