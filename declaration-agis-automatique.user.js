@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         LTOA - Agent Déclaration AGIS (Lot visible)
 // @namespace    https://ltoa-assurances.fr/
-// @version      1.1.5
+// @version      1.1.6
 // @description  Traite les contrats AGIS, contrôle chaque preuve de paiement dans toute la GED, puis génère une déclaration Excel financièrement sécurisée et un JSON auditable.
 // @author       LTOA Assurances
 // @match        https://courtage.modulr.fr/*
@@ -10,6 +10,7 @@
 // @require      https://cdn.jsdelivr.net/npm/exceljs@4.4.0/dist/exceljs.min.js
 // @grant        GM_xmlhttpRequest
 // @connect      courtage.modulr.fr
+// @connect      *
 // @run-at       document-idle
 // @updateURL    https://raw.githubusercontent.com/BiggerThanTheMall/declaration-agis/main/declaration-agis-automatique.user.js
 // @downloadURL  https://raw.githubusercontent.com/BiggerThanTheMall/declaration-agis/main/declaration-agis-automatique.user.js
@@ -19,7 +20,7 @@
     'use strict';
 
     const APP_ID = 'ltoa-agent-declaration-agis';
-    const CURRENT_VERSION = '1.1.5';
+    const CURRENT_VERSION = '1.1.6';
     const TESSERACT_OCR_OPTIONS = Object.freeze({
         workerPath: 'https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/worker.min.js',
         corePath: 'https://cdn.jsdelivr.net/npm/tesseract.js-core@5.1.1',
@@ -1136,15 +1137,37 @@
                 responseType: 'arraybuffer',
                 anonymous: false,
                 timeout: 45000,
+                redirect: 'follow',
+                headers: {
+                    Accept: 'application/pdf,image/*,*/*;q=0.8',
+                    Referer: location.href,
+                },
                 onload: response => {
+                    const finalUrl = response.finalUrl || response.responseURL || url;
                     if (response.status < 200 || response.status >= 300 || !response.response) {
-                        reject(new Error(`Téléchargement HTTP ${response.status || 'inconnu'}`));
+                        reject(new Error(
+                            `GM HTTP ${response.status || 'inconnu'} final=${clean(finalUrl, 220)}`
+                        ));
                         return;
                     }
-                    resolve(new Uint8Array(response.response));
+                    const bytes = new Uint8Array(response.response);
+                    if (!bytes.byteLength) {
+                        reject(new Error(`GM document vide final=${clean(finalUrl, 220)}`));
+                        return;
+                    }
+                    resolve(bytes);
                 },
-                onerror: () => reject(new Error('Téléchargement Modulr impossible')),
-                ontimeout: () => reject(new Error('Délai de téléchargement dépassé')),
+                onerror: response => {
+                    const finalUrl = response?.finalUrl || response?.responseURL || '';
+                    const status = response?.status || '';
+                    const statusText = response?.statusText || '';
+                    reject(new Error(
+                        `GM erreur${status ? ` HTTP ${status}` : ''}${statusText ? ` ${statusText}` : ''}${finalUrl ? ` final=${clean(finalUrl, 220)}` : ''}`
+                    ));
+                },
+                ontimeout: response => reject(new Error(
+                    `GM délai dépassé${response?.finalUrl ? ` final=${clean(response.finalUrl, 220)}` : ''}`
+                )),
             });
         });
     }
